@@ -1,11 +1,19 @@
-// table_column.dart
+import 'package:equatable/equatable.dart';
+
 enum DataType { text, number, date }
 
-class TableColumn {
-  String name;
-  DataType type;
+class TableColumn extends Equatable {
+  final String name;
+  final DataType type;
 
-  TableColumn({required this.name, required this.type});
+  const TableColumn({required this.name, required this.type});
+
+  TableColumn copyWith({String? name, DataType? type}) {
+    return TableColumn(
+      name: name ?? this.name,
+      type: type ?? this.type,
+    );
+  }
 
   Map<String, dynamic> toMap() {
     return {
@@ -23,4 +31,7 @@ class TableColumn {
       ),
     );
   }
+
+  @override
+  List<Object> get props => [name, type];
 }
