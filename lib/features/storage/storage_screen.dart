@@ -25,7 +25,7 @@ class StorageScreen extends StatefulWidget {
 }
 
 class _StorageScreenState extends State<StorageScreen> {
-  // State variables
+  // ======== STATE VARIABLES ========
   late List<TableColumn> columns;
   late List<TableRowData> rows;
   String searchQuery = '';
@@ -36,16 +36,19 @@ class _StorageScreenState extends State<StorageScreen> {
   DataType _newColumnType = DataType.text;
   final Map<String, bool> _rowSelection = {};
   final List<Map<String, dynamic>> _undoStack = [];
+  final List<Map<String, dynamic>> _redoStack = [];
   final FocusNode _focusNode = FocusNode();
   bool _isSaved = true;
   final List<String> _updateLogs = [];
-  final List<ColumnRelationship> columnRelationships = [];
+  List<ColumnRelationship> columnRelationships = [];
   final GlobalKey<FormState> _relationshipFormKey = GlobalKey<FormState>();
   String? _editingRelationshipId;
   final Map<String, dynamic> _previousValues = {};
   bool _isFullScreen = false;
-
-
+  bool _isSorting = false;
+  String? _sortColumn;
+  bool _sortAscending = true;
+  
   // Constants
   final List<ColumnDependency> columnDependencies = [
     ColumnDependency(
@@ -67,13 +70,32 @@ class _StorageScreenState extends State<StorageScreen> {
       targetBooleanColumn: AppStrings.lowStockStatus,
     ),
   ];
+  
+  // Maximum number of undo states to keep in memory
+  static const int _maxUndoStates = 20;
 
+  // ======== LIFECYCLE METHODS ========
   @override
   void initState() {
     super.initState();
     _initializeStorageData();
     _ensureRowIds();
     _initializeRowSelection();
+    
+    // Register for keyboard events
+    SystemChannels.keyEvent.setMessageHandler((message) async {
+      final keyMessage = KeyEventMessage.fromJson(message as Map<String, dynamic>);
+      if (keyMessage.type == 'keydown') {
+        if (keyMessage.isCtrlPressed && keyMessage.keyCode == 90) { // Ctrl+Z (Undo)
+          _undo();
+          return '';
+        } else if (keyMessage.isCtrlPressed && keyMessage.keyCode == 89) { // Ctrl+Y (Redo)
+          _redo();
+          return '';
+        }
+      }
+      return message as String;
+    });
   }
 
   @override
@@ -81,21 +103,44 @@ class _StorageScreenState extends State<StorageScreen> {
     _searchController.dispose();
     _newColumnNameController.dispose();
     _focusNode.dispose();
+    SystemChannels.keyEvent.setMessageHandler(null);
     super.dispose();
   }
 
-  /* Initialization Methods */
+  // ======== INITIALIZATION METHODS ========
   void _initializeStorageData() {
     if (widget.storage != null) {
-      columns = (widget.storage!['columns'] as List)
-          .map((e) => TableColumn.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
-      rows = (widget.storage!['rows'] as List)
-          .map((e) => TableRowData.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
+      try {
+        columns = (widget.storage!['columns'] as List)
+            .map((e) => TableColumn.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+            
+        rows = (widget.storage!['rows'] as List)
+            .map((e) => TableRowData.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+            
+        // Load relationships if they exist
+        if (widget.storage!.containsKey('relationships')) {
+          columnRelationships = (widget.storage!['relationships'] as List)
+              .map((e) => ColumnRelationship.fromMap(Map<String, dynamic>.from(e)))
+              .toList();
+        }
+      } catch (e) {
+        debugPrint('Error initializing storage data: $e');
+        // Fallback to defaults
+        columns = defaultColumns;
+        rows = [];
+        columnRelationships = [];
+      }
     } else {
       columns = defaultColumns;
       rows = [];
+      columnRelationships = [];
+    }
+    
+    // Initialize update logs 
+    if (widget.storage != null && widget.storage!.containsKey('updateLogs')) {
+      _updateLogs.addAll(List<String>.from(widget.storage!['updateLogs']));
     }
   }
 
@@ -122,8 +167,8 @@ class _StorageScreenState extends State<StorageScreen> {
       _rowSelection[row.data['id']] = false;
     }
   }
-
-  /* UI Building Methods */
+  
+  // ======== UI BUILDING METHODS ========
   @override
   Widget build(BuildContext context) {
     return WillPopScope(
@@ -147,16 +192,30 @@ class _StorageScreenState extends State<StorageScreen> {
         title: AppStrings.unsavedChanges,
         content: AppStrings.saveBeforeLeaving,
       );
-      if (shouldSave == true) await _saveToFirebase();
+      if (shouldSave == true && mounted) {
+        await _saveToFirebase();
+      }
     }
     return true;
   }
 
   void _handleKeyboardShortcuts(RawKeyEvent event) {
-    if (event is RawKeyDownEvent &&
-        event.logicalKey == LogicalKeyboardKey.keyZ &&
-        (event.isControlPressed || event.isMetaPressed)) {
-      _undo();
+    if (event is RawKeyDownEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.keyZ && 
+         (event.isControlPressed || event.isMetaPressed)) {
+        _undo();
+      } else if (event.logicalKey == LogicalKeyboardKey.keyY && 
+                (event.isControlPressed || event.isMetaPressed)) {
+        _redo();
+      } else if (event.logicalKey == LogicalKeyboardKey.keyS && 
+                (event.isControlPressed || event.isMetaPressed)) {
+        _saveToFirebase();
+      } else if (event.logicalKey == LogicalKeyboardKey.keyF && 
+                (event.isControlPressed || event.isMetaPressed)) {
+        FocusScope.of(context).requestFocus(
+          _searchController.focusNode ?? FocusNode()
+        );
+      }
     }
   }
 
@@ -172,6 +231,12 @@ class _StorageScreenState extends State<StorageScreen> {
         _buildActionButton(Icons.add, AppStrings.addRow, _showAddRowDialog),
         _buildActionButton(Icons.view_column, AppStrings.addColumn, _addColumn),
         _buildActionButton(Icons.save, AppStrings.save, _saveToFirebase),
+        _buildActionButton(Icons.undo, 'Undo (Ctrl+Z)', _undo),
+        _buildActionButton(Icons.redo, 'Redo (Ctrl+Y)', _redo),
+        _buildActionButton(
+          _isFullScreen ? Icons.fullscreen_exit : Icons.fullscreen, 
+          _isFullScreen ? 'Exit Fullscreen' : 'Fullscreen', 
+          _toggleFullScreen),
         _buildRowActionsMenu(),
         _buildColumnActionsMenu(),
       ],
@@ -186,6 +251,18 @@ class _StorageScreenState extends State<StorageScreen> {
     );
   }
 
+  void _toggleFullScreen() {
+    setState(() {
+      _isFullScreen = !_isFullScreen;
+    });
+    
+    if (_isFullScreen) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+  }
+
   Widget _buildRowActionsMenu() {
     return PopupMenuButton<String>(
       icon: const Icon(Icons.more_vert),
@@ -194,6 +271,8 @@ class _StorageScreenState extends State<StorageScreen> {
           case 'delete_rows': _deleteSelectedRows(); break;
           case 'duplicate_rows': _duplicateSelectedRows(); break;
           case 'copy_rows': _copySelectedRows(); break;
+          case 'export_csv': _exportToCsv(); break;
+          case 'import_csv': _importFromCsv(); break;
         }
       },
       itemBuilder: (context) => [
@@ -209,6 +288,14 @@ class _StorageScreenState extends State<StorageScreen> {
           value: 'copy_rows',
           child: Text(AppStrings.copySelectedRows),
         ),
+        const PopupMenuItem(
+          value: 'export_csv',
+          child: Text('Export to CSV'),
+        ),
+        const PopupMenuItem(
+          value: 'import_csv',
+          child: Text('Import from CSV'),
+        ),
       ],
     );
   }
@@ -221,6 +308,7 @@ class _StorageScreenState extends State<StorageScreen> {
           case 'delete_columns': _columnAction("delete"); break;
           case 'duplicate_columns': _columnAction("duplicate"); break;
           case 'copy_columns': _columnAction("copy"); break;
+          case 'sort_columns': _showSortDialog(); break;
         }
       },
       itemBuilder: (context) => [
@@ -236,6 +324,10 @@ class _StorageScreenState extends State<StorageScreen> {
           value: 'copy_columns',
           child: Text(AppStrings.copySelectedColumns),
         ),
+        const PopupMenuItem(
+          value: 'sort_columns',
+          child: Text('Sort Columns'),
+        ),
       ],
     );
   }
@@ -245,8 +337,27 @@ class _StorageScreenState extends State<StorageScreen> {
       children: [
         _buildSelectAllCheckbox(),
         _buildSearchField(),
+        if (_isSorting) _buildSortIndicator(),
         Expanded(child: _buildPlutoGrid()),
       ],
+    );
+  }
+
+  Widget _buildSortIndicator() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: AppColors.backgroundLight,
+      child: Row(
+        children: [
+          Text('Sorting by: $_sortColumn'),
+          Icon(_sortAscending ? Icons.arrow_upward : Icons.arrow_downward),
+          const Spacer(),
+          TextButton(
+            onPressed: _clearSorting,
+            child: const Text('Clear Sorting'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -280,10 +391,19 @@ class _StorageScreenState extends State<StorageScreen> {
       padding: const EdgeInsets.all(8.0),
       child: TextField(
         controller: _searchController,
-        decoration: const InputDecoration(
+        decoration: InputDecoration(
           labelText: AppStrings.search,
-          prefixIcon: Icon(Icons.search),
-          border: OutlineInputBorder(),
+          prefixIcon: const Icon(Icons.search),
+          border: const OutlineInputBorder(),
+          suffixIcon: searchQuery.isNotEmpty
+              ? IconButton(
+                  icon: const Icon(Icons.clear),
+                  onPressed: () {
+                    _searchController.clear();
+                    setState(() => searchQuery = '');
+                  },
+                )
+              : null,
         ),
         onChanged: (value) => setState(() => searchQuery = value),
       ),
@@ -325,52 +445,77 @@ class _StorageScreenState extends State<StorageScreen> {
   }
 
   void _updateRowSelection(String? rowId, bool? value) {
-    setState(() => _rowSelection[rowId!] = value ?? false);
-    _updateGrid();
+    if (mounted) {
+      setState(() => _rowSelection[rowId!] = value ?? false);
+      _updateGrid();
+    }
   }
 
   void _updateGrid() {
-    setState(() {
-      _gridRefreshKey++;
-      _isSaved = false;
-    });
+    if (mounted) {
+      setState(() {
+        _gridRefreshKey++;
+        _isSaved = false;
+      });
+    }
   }
+  
+  // ======== FIRESTORE OPERATIONS ========
   Map<String, dynamic> _prepareTableData() => {
     'columns': columns.map((col) => col.toMap()).toList(),
     'rows': rows.map((row) => row.toMap()).toList(),
     'relationships': columnRelationships.map((r) => r.toMap()).toList(),
+    'updateLogs': _updateLogs,
     'timestamp': FieldValue.serverTimestamp(),
   };
 
   void _handleSaveSuccess(Map<String, dynamic> tableData) {
-    setState(() {
-      _isSaved = true;
-      _updateLogs.add('Saved at ${DateTime.now().toLocal()}\nDetails: ${jsonEncode(tableData)}');
-    });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text(AppStrings.saveSuccess)),
-    );
+    if (mounted) {
+      setState(() {
+        _isSaved = true;
+        _logUpdate('Saved data', 'success');
+      });
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(AppStrings.saveSuccess)),
+      );
+    }
   }
 
-  // Firestore operations
   Future<void> _saveToFirebase() async {
+    if (!mounted) return;
+    
+    // Show loading indicator
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Saving data...'), duration: Duration(milliseconds: 500)),
+    );
+    
     try {
       final repository = context.read<StorageRepository>();
       final tableData = _prepareTableData();
 
-      widget.docId == null
-          ? await repository.addStorage(tableData)
-          : await repository.updateStorage(widget.docId!, tableData);
+      if (widget.docId == null) {
+        await repository.addStorage(tableData);
+      } else {
+        await repository.updateStorage(widget.docId!, tableData);
+      }
 
       _handleSaveSuccess(tableData);
     } catch (e) {
       _handleSaveError(e);
     }
   }
+  
   void _handleSaveError(dynamic error) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(AppStrings.saveError(error.toString()))),
-    );
+    if (mounted) {
+      _logUpdate('Save error: $error', 'error');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(AppStrings.saveError(error.toString())),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
   }
 
   PlutoColumn _buildIdColumn() => PlutoColumn(
@@ -384,11 +529,56 @@ class _StorageScreenState extends State<StorageScreen> {
   PlutoColumn _buildDataColumn(TableColumn col) => PlutoColumn(
     title: col.name,
     field: col.name,
-    type: col.type == DataType.number ? PlutoColumnType.number() : PlutoColumnType.text(),
+    type: col.type == DataType.number 
+        ? PlutoColumnType.number() 
+        : PlutoColumnType.text(),
+    readOnly: isColumnReadOnly(col),
+    enableSorting: true,
+    enableColumnDrag: true,
+    enableRowDrag: true,
+    enableContextMenu: true,
+    renderer: (context) {
+      final cell = context.cell;
+      final row = context.row;
+      final rowIndex = rows.indexWhere((r) => r.data['id'] == row.cells['id']?.value);
+      
+      // Apply special formatting for low stock status
+      if (col.name == AppStrings.lowStockStatus && cell.value == 'True') {
+        return Container(
+          color: AppColors.error.withOpacity(0.3),
+          alignment: Alignment.center,
+          child: Text(
+            cell.value.toString(),
+            style: const TextStyle(
+              color: AppColors.error,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        );
+      }
+      
+      return PlutoDefaultCellRenderer(cell: cell, text: cell.value.toString());
+    },
   );
 
+  bool isColumnReadOnly(TableColumn col) {
+    // Make calculated columns read-only
+    for (var dependency in columnDependencies) {
+      if (col.name == dependency.targetColumn) return true;
+    }
+    
+    // Make status columns read-only
+    for (var condition in thresholdConditions) {
+      if (col.name == condition.targetBooleanColumn) return true;
+    }
+    
+    return false;
+  }
+
   List<PlutoRow> _buildPlutoRows() {
-    return filteredRows.map((row) => PlutoRow(
+    final displayRows = _getSortedAndFilteredRows();
+    
+    return displayRows.map((row) => PlutoRow(
       cells: {
         'select': PlutoCell(value: false),
         'id': PlutoCell(value: row.data['id']),
@@ -398,23 +588,66 @@ class _StorageScreenState extends State<StorageScreen> {
     )).toList();
   }
 
-  List<TableRowData> get filteredRows {
-    if (searchQuery.isEmpty) return rows;
-    return rows.where((row) => row.data.values.any((value) =>
-    value != null && value.toString().toLowerCase().contains(searchQuery.toLowerCase()),
-    )).toList();
+  List<TableRowData> _getSortedAndFilteredRows() {
+    List<TableRowData> filteredData = searchQuery.isEmpty 
+        ? rows 
+        : rows.where((row) => row.data.values.any((value) =>
+            value != null && value.toString().toLowerCase().contains(searchQuery.toLowerCase()),
+          )).toList();
+    
+    // Apply sorting if set
+    if (_sortColumn != null) {
+      filteredData.sort((a, b) {
+        var aValue = a.data[_sortColumn];
+        var bValue = b.data[_sortColumn];
+        
+        // Handle null values
+        if (aValue == null && bValue == null) return 0;
+        if (aValue == null) return _sortAscending ? -1 : 1;
+        if (bValue == null) return _sortAscending ? 1 : -1;
+        
+        // Compare based on type
+        int comparison;
+        if (aValue is num && bValue is num) {
+          comparison = aValue.compareTo(bValue);
+        } else {
+          comparison = aValue.toString().compareTo(bValue.toString());
+        }
+        
+        return _sortAscending ? comparison : -comparison;
+      });
+    }
+    
+    return filteredData;
+  }
+
+  void _clearSorting() {
+    setState(() {
+      _isSorting = false;
+      _sortColumn = null;
+      _updateGrid();
+    });
   }
 
   PlutoGridConfiguration _gridConfig() {
     return PlutoGridConfiguration(
       columnSize: PlutoGridColumnSizeConfig(autoSizeMode: PlutoAutoSizeMode.scale),
       style: PlutoGridStyleConfig(
-        rowColor: Colors.red.withOpacity(0.2),
+        rowColor: (_) => AppColors.background,
+        oddRowColor: (_) => AppColors.background.withOpacity(0.9),
+        activatedColor: AppColors.primaryLight.withOpacity(0.2),
+        gridBorderColor: AppColors.divider,
+        borderColor: AppColors.divider,
+        activatedBorderColor: AppColors.primary,
+        inactivatedBorderColor: AppColors.divider,
+        gridBackgroundColor: AppColors.background,
       ),
+      enableColumnBorder: true,
+      enableRowColorAnimation: true,
     );
   }
 
-  /* Data Manipulation Methods */
+  // ======== DATA MANIPULATION METHODS ========
   void _handleCellChange(PlutoGridOnChangedEvent event) {
     final columnName = event.column.field;
     final newValue = event.value;
@@ -423,15 +656,35 @@ class _StorageScreenState extends State<StorageScreen> {
 
     if (rowIndex == -1) return;
 
+    // Store previous state for undo
     _pushUndoState();
+    
+    // Store the previous value before updating
+    _previousValues['${rowId}_$columnName'] = rows[rowIndex].data[columnName];
+    
+    // Update the cell value
     _updateRowData(rowIndex, columnName, newValue);
+    
+    // Process column dependencies
     _processDependencies(rowIndex, columnName, newValue);
+    
+    // Check for low stock
     _checkLowStock(rowIndex);
+    
+    // Process column relationships
+    _processRelationships(rowIndex, columnName, newValue);
+    
+    // Log the update
+    _logUpdate('Changed $columnName for row ${rowIndex + 1} from ${_previousValues['${rowId}_$columnName']} to $newValue', 'data');
+    
+    // Refresh the grid
     _updateGrid();
   }
 
   void _updateRowData(int rowIndex, String columnName, dynamic newValue) {
-    setState(() => rows[rowIndex].data[columnName] = newValue);
+    if (mounted) {
+      setState(() => rows[rowIndex].data[columnName] = newValue);
+    }
   }
 
   void _processDependencies(int rowIndex, String columnName, dynamic newValue) {
@@ -440,12 +693,14 @@ class _StorageScreenState extends State<StorageScreen> {
         final sourceValue = (newValue ?? 0).toDouble();
         final targetValue = (rows[rowIndex].data[dependency.targetColumn] ?? 0).toDouble();
 
-        setState(() {
-          rows[rowIndex].data[dependency.targetColumn] =
-          dependency.operation == 'subtract'
-              ? targetValue - sourceValue
-              : targetValue + sourceValue;
-        });
+        if (mounted) {
+          setState(() {
+            rows[rowIndex].data[dependency.targetColumn] =
+                dependency.operation == 'subtract'
+                    ? targetValue - sourceValue
+                    : targetValue + sourceValue;
+          });
+        }
       }
     }
   }
@@ -455,34 +710,100 @@ class _StorageScreenState extends State<StorageScreen> {
     for (var condition in thresholdConditions) {
       if (row.data.containsKey(condition.monitoredColumn)) {
         final value = (row.data[condition.monitoredColumn] ?? 0).toDouble();
-        setState(() {
-          row.data[condition.targetBooleanColumn] =
-          value < condition.threshold ? 'True' : 'False';
-        });
+        if (mounted) {
+          setState(() {
+            row.data[condition.targetBooleanColumn] =
+                value < condition.threshold ? 'True' : 'False';
+          });
+        }
+      }
+    }
+  }
+  
+  void _processRelationships(int rowIndex, String columnName, dynamic newValue) {
+    for (var relationship in columnRelationships) {
+      // If this column is a source in a relationship
+      if (relationship.sourceColumn == columnName) {
+        // Find all rows with the same values
+        final sourceValue = newValue;
+        
+        for (int i = 0; i < rows.length; i++) {
+          if (i != rowIndex) {
+            // Check if this other row should be updated based on the relationship
+            if (rows[i].data[columnName] == sourceValue) {
+              // Get target value from changed row
+              final targetValue = rows[rowIndex].data[relationship.targetColumn];
+              
+              // Update the target column in this related row
+              if (mounted) {
+                setState(() {
+                  rows[i].data[relationship.targetColumn] = targetValue;
+                });
+              }
+            }
+          }
+        }
       }
     }
   }
 
-  /* Column Management */
+  void _logUpdate(String message, String type) {
+    final timestamp = DateTime.now().toLocal().toString();
+    final logEntry = '[$timestamp] [$type] $message';
+    
+    if (mounted) {
+      setState(() {
+        _updateLogs.add(logEntry);
+        // Limit log size
+        if (_updateLogs.length > 100) {
+          _updateLogs.removeAt(0);
+        }
+      });
+    }
+  }
+
+  // ======== COLUMN MANAGEMENT ========
   void _showEditColumnsDialog() {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text(AppStrings.editColumns),
-        content: SingleChildScrollView(
-          child: Column(
-            children: columns.asMap().entries.map((entry) =>
-                ListTile(
-                  title: Text(entry.value.name),
-                  trailing: IconButton(
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 400,
+          child: ListView.builder(
+            itemCount: columns.length,
+            itemBuilder: (context, index) => ListTile(
+              leading: Icon(
+                columns[index].type == DataType.number 
+                    ? Icons.numbers 
+                    : Icons.text_fields,
+                color: AppColors.primary,
+              ),
+              title: Text(columns[index].name),
+              subtitle: Text('Type: ${columns[index].type.toString().split('.').last}'),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
                     icon: const Icon(Icons.edit),
+                    tooltip: 'Edit Column',
                     onPressed: () {
                       Navigator.pop(context);
-                      _editColumn(entry.key);
+                      _editColumn(index);
                     },
                   ),
-                ),
-            ).toList(),
+                  IconButton(
+                    icon: const Icon(Icons.delete),
+                    tooltip: 'Delete Column',
+                    onPressed: () {
+                      Navigator.pop(context);
+                      _confirmDeleteColumn(index);
+                    },
+                  ),
+                ],
+              ),
+            ),
           ),
         ),
         actions: [
@@ -493,6 +814,88 @@ class _StorageScreenState extends State<StorageScreen> {
         ],
       ),
     );
+  }
+
+  void _confirmDeleteColumn(int index) {
+    final columnName = columns[index].name;
+    
+    // Check if this column is used in relationships or dependencies
+    bool isUsedInRelationships = columnRelationships.any(
+      (rel) => rel.sourceColumn == columnName || rel.targetColumn == columnName
+    );
+    
+    bool isUsedInDependencies = columnDependencies.any(
+      (dep) => dep.sourceColumn == columnName || dep.targetColumn == columnName
+    );
+    
+    bool isUsedInThresholds = thresholdConditions.any(
+      (threshold) => threshold.monitoredColumn == columnName || 
+                     threshold.targetBooleanColumn == columnName
+    );
+    
+    if (isUsedInRelationships || isUsedInDependencies || isUsedInThresholds) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Cannot Delete Column'),
+          content: Text(
+            'The column "$columnName" cannot be deleted because it is used in '
+            '${isUsedInRelationships ? 'relationships' : ''}'
+            '${isUsedInDependencies ? (isUsedInRelationships ? ', ' : '') + 'dependencies' : ''}'
+            '${isUsedInThresholds ? ((isUsedInRelationships || isUsedInDependencies) ? ', ' : '') + 'thresholds' : ''}'
+            '. Please remove these dependencies first.'
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text(AppStrings.confirmDelete),
+        content: Text('Are you sure you want to delete the column "$columnName"? This action cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text(AppStrings.cancel),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _deleteColumn(index);
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
+            child: const Text(AppStrings.delete),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _deleteColumn(int index) {
+    _pushUndoState();
+    
+    final columnName = columns[index].name;
+    
+    setState(() {
+      columns.removeAt(index);
+      
+      // Remove column data from all rows
+      for (var row in rows) {
+        row.data.remove(columnName);
+      }
+      
+      _logUpdate('Deleted column: $columnName', 'structure');
+    });
+    
+    _updateGrid();
   }
 
   void _editColumn(int index) {
@@ -511,6 +914,7 @@ class _StorageScreenState extends State<StorageScreen> {
             TextField(
               controller: controller,
               decoration: const InputDecoration(labelText: AppStrings.columnName),
+              autofocus: true,
             ),
             const SizedBox(height: 10),
             DropdownButton<DataType>(
@@ -539,17 +943,72 @@ class _StorageScreenState extends State<StorageScreen> {
 
   void _saveColumnEdit(int index, String newName, DataType newType) {
     final oldName = columns[index].name;
+    final oldType = columns[index].type;
+    
+    if (newName.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Column name cannot be empty')),
+      );
+      return;
+    }
+    
+    // Check if column name already exists
+    if (newName != oldName && columns.any((col) => col.name == newName)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('A column with this name already exists')),
+      );
+      return;
+    }
 
     setState(() {
       columns[index] = columns[index].copyWith(name: newName, type: newType);
 
       if (oldName != newName) {
+        // Update column name in all rows
         for (var row in rows) {
           final value = row.data[oldName];
           row.data.remove(oldName);
           row.data[newName] = value;
         }
+        
+        // Update column references in relationships
+        for (int i = 0; i < columnRelationships.length; i++) {
+          if (columnRelationships[i].sourceColumn == oldName) {
+            columnRelationships[i] = ColumnRelationship(
+              sourceColumn: newName,
+              targetColumn: columnRelationships[i].targetColumn,
+            );
+          }
+          
+          if (columnRelationships[i].targetColumn == oldName) {
+            columnRelationships[i] = ColumnRelationship(
+              sourceColumn: columnRelationships[i].sourceColumn,
+              targetColumn: newName,
+            );
+          }
+        }
       }
+      
+      // If type changed, convert values
+      if (oldType != newType) {
+        for (var row in rows) {
+          if (row.data.containsKey(newName)) {
+            if (newType == DataType.number && row.data[newName] is String) {
+              // Convert to number
+              row.data[newName] = num.tryParse(row.data[newName] ?? '') ?? 0;
+            } else if (newType == DataType.text && row.data[newName] is num) {
+              // Convert to text
+              row.data[newName] = row.data[newName].toString();
+            }
+          }
+        }
+      }
+      
+      _logUpdate(
+        'Edited column: ${oldName != newName ? "$oldName → $newName" : newName}, ' 
+        'Type: ${oldType != newType ? "${oldType.toString().split('.').last} → ${newType.toString().split('.').last}" : newType.toString().split('.').last}', 
+        'structure'
+      );
     });
 
     Navigator.pop(context);
@@ -569,7 +1028,9 @@ class _StorageScreenState extends State<StorageScreen> {
             TextField(
               controller: _newColumnNameController,
               decoration: const InputDecoration(labelText: AppStrings.columnName),
+              autofocus: true,
             ),
+            const SizedBox(height: 10),
             DropdownButton<DataType>(
               value: _newColumnType,
               onChanged: (value) => setState(() => _newColumnType = value ?? _newColumnType),
@@ -599,13 +1060,30 @@ class _StorageScreenState extends State<StorageScreen> {
 
   void _saveNewColumn() {
     final newColName = _newColumnNameController.text.trim();
-    if (newColName.isEmpty) return;
+    if (newColName.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Column name cannot be empty')),
+      );
+      return;
+    }
+    
+    // Check if column name already exists
+    if (columns.any((col) => col.name == newColName)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('A column with this name already exists')),
+      );
+      return;
+    }
 
     setState(() {
       columns.add(TableColumn(name: newColName, type: _newColumnType));
+      
+      // Initialize column in all rows
       for (var row in rows) {
-        row.data[newColName] = null;
+        row.data[newColName] = _newColumnType == DataType.number ? 0 : '';
       }
+      
+      _logUpdate('Added new column: $newColName (${_newColumnType.toString().split('.').last})', 'structure');
     });
 
     _newColumnNameController.clear();
@@ -625,9 +1103,10 @@ class _StorageScreenState extends State<StorageScreen> {
       builder: (context) => AlertDialog(
         title: Text('${AppStrings.selectColumnsFor} $action'),
         content: StatefulBuilder(
-          builder: (context, setState) => SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+          builder: (context, setState) => SizedBox(
+            width: double.maxFinite,
+            height: 400,
+            child: ListView(
               children: availableColumns.map((colName) => CheckboxListTile(
                 title: Text(colName),
                 value: selected.contains(colName),
@@ -650,6 +1129,13 @@ class _StorageScreenState extends State<StorageScreen> {
           ElevatedButton(
             onPressed: () {
               Navigator.pop(context);
+              if (selected.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('No columns selected')),
+                );
+                return;
+              }
+              
               switch (action) {
                 case "delete": _deleteColumns(selected); break;
                 case "duplicate": _duplicateColumns(selected); break;
@@ -664,6 +1150,60 @@ class _StorageScreenState extends State<StorageScreen> {
   }
 
   void _deleteColumns(List<String> selectedColumns) {
+    // Check if any selected columns are used in relationships, dependencies, or thresholds
+    final usedColumns = <String>[];
+    
+    for (var colName in selectedColumns) {
+      bool isUsed = false;
+      
+      // Check relationships
+      if (columnRelationships.any(
+        (rel) => rel.sourceColumn == colName || rel.targetColumn == colName
+      )) {
+        isUsed = true;
+      }
+      
+      // Check dependencies
+      if (columnDependencies.any(
+        (dep) => dep.sourceColumn == colName || dep.targetColumn == colName
+      )) {
+        isUsed = true;
+      }
+      
+      // Check thresholds
+      if (thresholdConditions.any(
+        (threshold) => threshold.monitoredColumn == colName || 
+                      threshold.targetBooleanColumn == colName
+      )) {
+        isUsed = true;
+      }
+      
+      if (isUsed) {
+        usedColumns.add(colName);
+      }
+    }
+    
+    if (usedColumns.isNotEmpty) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Cannot Delete Columns'),
+          content: Text(
+            'The following columns cannot be deleted because they are used in relationships, '
+            'dependencies, or thresholds: ${usedColumns.join(', ')}. '
+            'Please remove these dependencies first.'
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    
     _pushUndoState();
     setState(() {
       columns.removeWhere((col) => selectedColumns.contains(col.name));
@@ -672,6 +1212,8 @@ class _StorageScreenState extends State<StorageScreen> {
           row.data.remove(colName);
         }
       }
+      
+      _logUpdate('Deleted columns: ${selectedColumns.join(', ')}', 'structure');
     });
     _updateGrid();
   }
@@ -691,6 +1233,8 @@ class _StorageScreenState extends State<StorageScreen> {
           row.data[newColName] = row.data[colName];
         }
       }
+      
+      _logUpdate('Duplicated columns: ${selectedColumns.join(', ')}', 'structure');
     });
     _updateGrid();
   }
@@ -708,9 +1252,90 @@ class _StorageScreenState extends State<StorageScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text(AppStrings.columnsCopied)),
     );
+    
+    _logUpdate('Copied columns to clipboard: ${selectedColumns.join(', ')}', 'action');
+  }
+  
+  void _showSortDialog() {
+    String? selectedColumn = _sortColumn;
+    bool ascending = _sortAscending;
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Sort Data'),
+        content: StatefulBuilder(
+          builder: (context, setState) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              DropdownButtonFormField<String>(
+                value: selectedColumn,
+                decoration: const InputDecoration(
+                  labelText: 'Sort by Column',
+                  border: OutlineInputBorder(),
+                ),
+                items: columns
+                    .map((col) => col.name)
+                    .map((name) => DropdownMenuItem<String>(
+                      value: name,
+                      child: Text(name),
+                    ))
+                    .toList(),
+                onChanged: (value) => setState(() => selectedColumn = value),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: RadioListTile<bool>(
+                      title: const Text('Ascending'),
+                      value: true,
+                      groupValue: ascending,
+                      onChanged: (value) => setState(() => ascending = value ?? true),
+                    ),
+                  ),
+                  Expanded(
+                    child: RadioListTile<bool>(
+                      title: const Text('Descending'),
+                      value: false,
+                      groupValue: ascending,
+                      onChanged: (value) => setState(() => ascending = value ?? false),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text(AppStrings.cancel),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              
+              if (selectedColumn == null) {
+                return;
+              }
+              
+              setState(() {
+                _sortColumn = selectedColumn;
+                _sortAscending = ascending;
+                _isSorting = true;
+              });
+              
+              _updateGrid();
+            },
+            child: const Text('Apply Sort'),
+          ),
+        ],
+      ),
+    );
   }
 
-  /* Row Management */
+  // ======== ROW MANAGEMENT ========
   void _showAddRowDialog() {
     final controllers = <String, TextEditingController>{};
     for (var col in columns) {
@@ -724,14 +1349,18 @@ class _StorageScreenState extends State<StorageScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text(AppStrings.addNewRow),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 400,
+          child: ListView(
             children: controllers.entries.map((entry) => Padding(
               padding: const EdgeInsets.symmetric(vertical: 8.0),
               child: TextField(
                 controller: entry.value,
-                decoration: InputDecoration(labelText: entry.key),
+                decoration: InputDecoration(
+                  labelText: entry.key,
+                  border: const OutlineInputBorder(),
+                ),
                 keyboardType: _getKeyboardTypeForColumn(entry.key),
               ),
             )).toList(),
@@ -780,6 +1409,12 @@ class _StorageScreenState extends State<StorageScreen> {
     setState(() {
       rows.add(TableRowData(data: newRowData));
       _rowSelection[newRowData['id']] = false;
+      
+      // Process thresholds for the new row
+      final newRowIndex = rows.length - 1;
+      _checkLowStock(newRowIndex);
+      
+      _logUpdate('Added new row with ID: ${newRowData['id']}', 'data');
     });
 
     Navigator.pop(context);
@@ -803,7 +1438,7 @@ class _StorageScreenState extends State<StorageScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text(AppStrings.confirmDelete),
-        content: const Text(AppStrings.confirmDeleteRows),
+        content: Text('Are you sure you want to delete ${selectedIds.length} selected rows?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -814,6 +1449,7 @@ class _StorageScreenState extends State<StorageScreen> {
               Navigator.pop(context);
               _performRowDeletion(selectedIds);
             },
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
             child: const Text(AppStrings.delete),
           ),
         ],
@@ -828,6 +1464,8 @@ class _StorageScreenState extends State<StorageScreen> {
       for (var id in selectedIds) {
         _rowSelection.remove(id);
       }
+      
+      _logUpdate('Deleted ${selectedIds.length} rows', 'data');
     });
     _updateGrid();
   }
@@ -847,6 +1485,8 @@ class _StorageScreenState extends State<StorageScreen> {
 
     _pushUndoState();
     setState(() {
+      final newRows = <TableRowData>[];
+      
       for (var id in selectedIds) {
         final original = rows.firstWhere(
               (row) => row.data['id'] == id,
@@ -855,10 +1495,18 @@ class _StorageScreenState extends State<StorageScreen> {
 
         if (original.data.isNotEmpty) {
           final newData = Map<String, dynamic>.from(original.data);
-          newData['id'] = DateTime.now().millisecondsSinceEpoch.toString();
-          rows.add(TableRowData(data: newData));
+          newData['id'] = '${DateTime.now().millisecondsSinceEpoch}_${rows.length + newRows.length}';
+          newRows.add(TableRowData(data: newData));
         }
       }
+      
+      rows.addAll(newRows);
+      
+      for (var row in newRows) {
+        _rowSelection[row.data['id']] = false;
+      }
+      
+      _logUpdate('Duplicated ${selectedIds.length} rows', 'data');
     });
     _updateGrid();
   }
@@ -885,6 +1533,8 @@ class _StorageScreenState extends State<StorageScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text(AppStrings.rowsCopied)),
     );
+    
+    _logUpdate('Copied ${selectedIds.length} rows to clipboard', 'action');
   }
 
   void _editCell(TableRowData row, String columnName, DataType type) {
@@ -922,14 +1572,19 @@ class _StorageScreenState extends State<StorageScreen> {
 
   void _saveCellEdit(TableRowData row, String columnName, DataType type, String value) {
     setState(() {
+      final oldValue = row.data[columnName];
+      
       row.data[columnName] = type == DataType.number
           ? num.tryParse(value) ?? 0
           : value;
+          
+      _logUpdate('Edited cell: $columnName, from $oldValue to ${row.data[columnName]}', 'data');
     });
 
     final rowIndex = rows.indexWhere((r) => r.data['id'] == row.data['id']);
     if (rowIndex != -1) {
       _updateDependentColumn(columnName, rowIndex);
+      _processRelationships(rowIndex, columnName, row.data[columnName]);
     }
 
     Navigator.pop(context);
@@ -955,8 +1610,220 @@ class _StorageScreenState extends State<StorageScreen> {
     _checkLowStock(rowIndex);
     _updateGrid();
   }
-
-  /* Relationship Management */
+  
+  // ======== EXPORT/IMPORT FUNCTIONALITY ========
+  void _exportToCsv() {
+    if (rows.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No data to export')),
+      );
+      return;
+    }
+    
+    // Create CSV header row
+    final header = columns.map((col) => col.name).join(',');
+    
+    // Create CSV data rows
+    final csvRows = rows.map((row) {
+      return columns.map((col) {
+        final value = row.data[col.name];
+        
+        // Handle null values
+        if (value == null) return '';
+        
+        // Handle values with commas
+        if (value.toString().contains(',')) {
+          return '"${value.toString()}"';
+        }
+        
+        return value.toString();
+      }).join(',');
+    }).join('\
+');
+    
+    // Combine header and data
+    final csv = '$header\
+$csvRows';
+    
+    Clipboard.setData(ClipboardData(text: csv));
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('CSV data copied to clipboard')),
+    );
+    
+    _logUpdate('Exported data to CSV', 'action');
+  }
+  
+  void _importFromCsv() {
+    final controller = TextEditingController();
+    
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Import from CSV'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Paste your CSV data below. The first line should contain column headers that match your existing columns.',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              maxLines: 10,
+              decoration: const InputDecoration(
+                hintText: 'Paste CSV data here...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text(AppStrings.cancel),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _processCsvImport(controller.text);
+            },
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  void _processCsvImport(String csvData) {
+    if (csvData.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No CSV data provided')),
+      );
+      return;
+    }
+    
+    try {
+      final lines = csvData.split('\
+');
+      if (lines.isEmpty) {
+        throw 'Invalid CSV format';
+      }
+      
+      // Parse header
+      final headerLine = lines[0].trim();
+      final headers = _parseCsvLine(headerLine);
+      
+      // Validate headers against existing columns
+      final unknownColumns = headers.where(
+        (header) => !columns.any((col) => col.name == header)
+      ).toList();
+      
+      if (unknownColumns.isNotEmpty) {
+        throw 'Unknown columns: ${unknownColumns.join(', ')}';
+      }
+      
+      _pushUndoState();
+      
+      // Process data rows
+      final newRows = <TableRowData>[];
+      
+      for (int i = 1; i < lines.length; i++) {
+        final line = lines[i].trim();
+        if (line.isEmpty) continue;
+        
+        final values = _parseCsvLine(line);
+        
+        if (values.length != headers.length) {
+          throw 'Line ${i + 1} has ${values.length} values but expected ${headers.length}';
+        }
+        
+        final rowData = <String, dynamic>{
+          'id': '${DateTime.now().millisecondsSinceEpoch}_$i',
+        };
+        
+        for (int j = 0; j < headers.length; j++) {
+          final colName = headers[j];
+          final value = values[j];
+          
+          // Get column type
+          final columnType = columns
+              .firstWhere((col) => col.name == colName)
+              .type;
+          
+          // Convert value based on column type
+          if (columnType == DataType.number) {
+            rowData[colName] = num.tryParse(value) ?? 0;
+          } else {
+            rowData[colName] = value;
+          }
+        }
+        
+        // Add missing columns with default values
+        for (var col in columns) {
+          if (!rowData.containsKey(col.name)) {
+            rowData[col.name] = col.type == DataType.number ? 0 : '';
+          }
+        }
+        
+        newRows.add(TableRowData(data: rowData));
+      }
+      
+      setState(() {
+        rows.addAll(newRows);
+        
+        // Initialize row selection for new rows
+        for (var row in newRows) {
+          _rowSelection[row.data['id']] = false;
+        }
+        
+        // Process dependencies and thresholds for new rows
+        for (int i = rows.length - newRows.length; i < rows.length; i++) {
+          _checkLowStock(i);
+        }
+        
+        _logUpdate('Imported ${newRows.length} rows from CSV', 'data');
+      });
+      
+      _updateGrid();
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Successfully imported ${newRows.length} rows')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error importing CSV: $e'),
+          backgroundColor: AppColors.error,
+        ),
+      );
+    }
+  }
+  
+  List<String> _parseCsvLine(String line) {
+    final values = <String>[];
+    bool inQuotes = false;
+    String currentValue = '';
+    
+    for (int i = 0; i < line.length; i++) {
+      final char = line[i];
+      
+      if (char == '"') {
+        inQuotes = !inQuotes;
+      } else if (char == ',' && !inQuotes) {
+        values.add(currentValue);
+        currentValue = '';
+      } else {
+        currentValue += char;
+      }
+    }
+    
+    values.add(currentValue);
+    return values;
+  }
+  
+  // ======== RELATIONSHIP MANAGEMENT ========
   void _showRelationshipsManager() {
     showDialog(
       context: context,
@@ -964,29 +1831,42 @@ class _StorageScreenState extends State<StorageScreen> {
         title: const Text(AppStrings.manageRelationships),
         content: SizedBox(
           width: double.maxFinite,
-          child: ListView.builder(
-            shrinkWrap: true,
-            itemCount: columnRelationships.length,
-            itemBuilder: (context, index) => ListTile(
-              title: Text(
-                '${columnRelationships[index].sourceColumn} → '
-                    '${columnRelationships[index].targetColumn}',
-              ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: const Icon(Icons.edit),
-                    onPressed: () => _showEditRelationshipDialog(index),
+          height: columnRelationships.isEmpty ? 100 : 300,
+          child: columnRelationships.isEmpty
+              ? const Center(
+                  child: Text(
+                    'No relationships defined yet. Click "Add New" to create one.',
+                    textAlign: TextAlign.center,
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.delete),
-                    onPressed: () => _deleteRelationship(index),
+                )
+              : ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: columnRelationships.length,
+                  itemBuilder: (context, index) => Card(
+                    margin: const EdgeInsets.symmetric(vertical: 4),
+                    child: ListTile(
+                      title: Text(
+                        '${columnRelationships[index].sourceColumn} → ${columnRelationships[index].targetColumn}',
+                      ),
+                      subtitle: const Text('When source values match, target values will sync'),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          IconButton(
+                            icon: const Icon(Icons.edit),
+                            tooltip: 'Edit Relationship',
+                            onPressed: () => _showEditRelationshipDialog(index),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete),
+                            tooltip: 'Delete Relationship',
+                            onPressed: () => _deleteRelationship(index),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
-                ],
-              ),
-            ),
-          ),
+                ),
         ),
         actions: [
           TextButton(
@@ -1003,6 +1883,8 @@ class _StorageScreenState extends State<StorageScreen> {
   }
 
   void _showCreateRelationshipDialog([int? editIndex]) {
+    _pushUndoState();
+    
     CustomDialog.showRelationshipDialog(
       context: context,
       numericColumns: columns
@@ -1016,13 +1898,53 @@ class _StorageScreenState extends State<StorageScreen> {
         setState(() {
           if (editIndex != null) {
             columnRelationships[editIndex] = relationship;
+            _logUpdate('Updated relationship: ${relationship.sourceColumn} → ${relationship.targetColumn}', 'structure');
           } else {
             columnRelationships.add(relationship);
+            _logUpdate('Added new relationship: ${relationship.sourceColumn} → ${relationship.targetColumn}', 'structure');
           }
         });
+        
+        // Apply relationship immediately to existing data
+        _applyRelationshipToExistingData(relationship);
+        
         _updateGrid();
       }
     });
+  }
+  
+  void _applyRelationshipToExistingData(ColumnRelationship relationship) {
+    // Group rows by source column value
+    final groupedRows = <dynamic, List<int>>{};
+    
+    for (int i = 0; i < rows.length; i++) {
+      final row = rows[i];
+      final sourceValue = row.data[relationship.sourceColumn];
+      
+      if (sourceValue != null) {
+        if (!groupedRows.containsKey(sourceValue)) {
+          groupedRows[sourceValue] = [];
+        }
+        groupedRows[sourceValue]!.add(i);
+      }
+    }
+    
+    // Update target column values for each group
+    for (final entry in groupedRows.entries) {
+      if (entry.value.length > 1) {
+        final rowIndices = entry.value;
+        final firstRowIndex = rowIndices.first;
+        final targetValue = rows[firstRowIndex].data[relationship.targetColumn];
+        
+        // Update all rows in the group
+        for (int i = 1; i < rowIndices.length; i++) {
+          final rowIndex = rowIndices[i];
+          setState(() {
+            rows[rowIndex].data[relationship.targetColumn] = targetValue;
+          });
+        }
+      }
+    }
   }
 
   void _deleteRelationship(int index) {
@@ -1030,7 +1952,11 @@ class _StorageScreenState extends State<StorageScreen> {
       context: context,
       builder: (context) => AlertDialog(
         title: const Text(AppStrings.confirmDelete),
-        content: const Text(AppStrings.confirmDeleteRelationship),
+        content: Text(
+          'Are you sure you want to delete the relationship between '
+          '${columnRelationships[index].sourceColumn} and '
+          '${columnRelationships[index].targetColumn}?'
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
@@ -1038,10 +1964,17 @@ class _StorageScreenState extends State<StorageScreen> {
           ),
           ElevatedButton(
             onPressed: () {
-              setState(() => columnRelationships.removeAt(index));
+              _pushUndoState();
+              
+              setState(() {
+                final rel = columnRelationships[index];
+                _logUpdate('Deleted relationship: ${rel.sourceColumn} → ${rel.targetColumn}', 'structure');
+                columnRelationships.removeAt(index);
+              });
               Navigator.pop(context);
               _updateGrid();
             },
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
             child: const Text(AppStrings.delete),
           ),
         ],
@@ -1053,34 +1986,105 @@ class _StorageScreenState extends State<StorageScreen> {
     _editingRelationshipId = columnRelationships[index].sourceColumn;
     _showCreateRelationshipDialog(index);
   }
-
-  /* Undo/Redo Functionality */
+  
+  // ======== UNDO/REDO FUNCTIONALITY ========
   void _pushUndoState() {
-    _undoStack.add({
+    if (!mounted) return;
+    
+    final currentState = {
       "columns": jsonEncode(columns.map((c) => c.toMap()).toList()),
       "rows": jsonEncode(rows.map((r) => r.toMap()).toList()),
-    });
+      "relationships": jsonEncode(columnRelationships.map((r) => r.toMap()).toList()),
+    };
+    
+    _undoStack.add(currentState);
+    
+    // Clear redo stack when new action is performed
+    _redoStack.clear();
+    
+    // Limit undo stack size
+    if (_undoStack.length > _maxUndoStates) {
+      _undoStack.removeAt(0);
+    }
   }
 
   void _undo() {
-    if (_undoStack.isEmpty) return;
+    if (_undoStack.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nothing to undo')),
+      );
+      return;
+    }
 
+    // Store current state for redo
+    final currentState = {
+      "columns": jsonEncode(columns.map((c) => c.toMap()).toList()),
+      "rows": jsonEncode(rows.map((r) => r.toMap()).toList()),
+      "relationships": jsonEncode(columnRelationships.map((r) => r.toMap()).toList()),
+    };
+    
+    _redoStack.add(currentState);
+    
+    // Restore previous state
     final state = _undoStack.removeLast();
-    final colsJson = jsonDecode(state["columns"]) as List;
-    final rowsJson = jsonDecode(state["rows"]) as List;
-
-    setState(() {
-      columns = colsJson.map((e) => TableColumn.fromMap(e)).toList();
-      rows = rowsJson.map((e) => TableRowData.fromMap(e)).toList();
-      _rowSelection.clear();
-      for (var row in rows) {
-        _rowSelection[row.data['id']] = false;
-      }
-    });
-    _updateGrid();
+    _restoreState(state);
+    
+    _logUpdate('Undo operation performed', 'action');
   }
+  
+  void _redo() {
+    if (_redoStack.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nothing to redo')),
+      );
+      return;
+    }
+    
+    // Store current state for undo
+    final currentState = {
+      "columns": jsonEncode(columns.map((c) => c.toMap()).toList()),
+      "rows": jsonEncode(rows.map((r) => r.toMap()).toList()),
+      "relationships": jsonEncode(columnRelationships.map((r) => r.toMap()).toList()),
+    };
+    
+    _undoStack.add(currentState);
+    
+    // Restore next state
+    final state = _redoStack.removeLast();
+    _restoreState(state);
+    
+    _logUpdate('Redo operation performed', 'action');
+  }
+  
+  void _restoreState(Map<String, dynamic> state) {
+    if (!mounted) return;
+    
+    try {
+      final colsJson = jsonDecode(state["columns"]) as List;
+      final rowsJson = jsonDecode(state["rows"]) as List;
+      final relationshipsJson = jsonDecode(state["relationships"]) as List;
 
-  /* Logging and Miscellaneous */
+      setState(() {
+        columns = colsJson.map((e) => TableColumn.fromMap(e as Map<String, dynamic>)).toList();
+        rows = rowsJson.map((e) => TableRowData.fromMap(e as Map<String, dynamic>)).toList();
+        columnRelationships = relationshipsJson.map((e) => ColumnRelationship.fromMap(e as Map<String, dynamic>)).toList();
+        
+        // Reset row selection
+        _rowSelection.clear();
+        for (var row in rows) {
+          _rowSelection[row.data['id']] = false;
+        }
+      });
+      
+      _updateGrid();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error restoring state: $e')),
+      );
+    }
+  }
+  
+  // ======== UPDATE LOGS ========
   void _showUpdateLogs() {
     showDialog(
       context: context,
@@ -1088,21 +2092,94 @@ class _StorageScreenState extends State<StorageScreen> {
         title: const Text(AppStrings.updateLogs),
         content: SizedBox(
           width: double.maxFinite,
-          child: ListView.builder(
-            shrinkWrap: true,
-            itemCount: _updateLogs.length,
-            itemBuilder: (context, index) => ListTile(
-              title: Text(_updateLogs[index]),
-            ),
-          ),
+          height: 400,
+          child: _updateLogs.isEmpty
+              ? const Center(child: Text('No update logs available'))
+              : ListView.builder(
+                  itemCount: _updateLogs.length,
+                  itemBuilder: (context, index) {
+                    final log = _updateLogs[_updateLogs.length - 1 - index];
+                    
+                    // Parse log type from prefix
+                    Color logColor = AppColors.textPrimary;
+                    IconData logIcon = Icons.info_outline;
+                    
+                    if (log.contains('[success]')) {
+                      logColor = AppColors.success;
+                      logIcon = Icons.check_circle;
+                    } else if (log.contains('[error]')) {
+                      logColor = AppColors.error;
+                      logIcon = Icons.error;
+                    } else if (log.contains('[structure]')) {
+                      logColor = AppColors.primary;
+                      logIcon = Icons.view_column;
+                    } else if (log.contains('[data]')) {
+                      logColor = AppColors.info;
+                      logIcon = Icons.edit;
+                    } else if (log.contains('[action]')) {
+                      logColor = AppColors.secondary;
+                      logIcon = Icons.touch_app;
+                    }
+                    
+                    return Card(
+                      margin: const EdgeInsets.symmetric(vertical: 4),
+                      child: ListTile(
+                        leading: Icon(logIcon, color: logColor),
+                        title: Text(log),
+                        textColor: logColor,
+                      ),
+                    );
+                  },
+                ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
             child: const Text(AppStrings.close),
           ),
+          ElevatedButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: _updateLogs.join('\
+')));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Logs copied to clipboard')),
+              );
+            },
+            child: const Text('Copy All'),
+          ),
         ],
       ),
+    );
+  }
+}
+
+class KeyEventMessage {
+  final String type;
+  final bool isCtrlPressed;
+  final bool isAltPressed;
+  final bool isShiftPressed;
+  final bool isMetaPressed;
+  final int keyCode;
+
+  KeyEventMessage({
+    required this.type,
+    this.isCtrlPressed = false,
+    this.isAltPressed = false,
+    this.isShiftPressed = false,
+    this.isMetaPressed = false,
+    this.keyCode = 0,
+  });
+
+  factory KeyEventMessage.fromJson(Map<String, dynamic> json) {
+    final keyboardEvent = json['keyboardEvent'] as Map<String, dynamic>;
+    
+    return KeyEventMessage(
+      type: json['type'] as String,
+      isCtrlPressed: keyboardEvent['ctrlKey'] == true,
+      isAltPressed: keyboardEvent['altKey'] == true,
+      isShiftPressed: keyboardEvent['shiftKey'] == true,
+      isMetaPressed: keyboardEvent['metaKey'] == true,
+      keyCode: (keyboardEvent['keyCode'] as num?)?.toInt() ?? 0,
     );
   }
 }
